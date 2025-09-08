@@ -482,19 +482,37 @@ class TextualInversionDataset(Dataset):
         placeholder_string = self.placeholder_token
         text = random.choice(self.templates).format(placeholder_string)
 
+        # Keep original size for SDXL conditioning
         example["original_size"] = (image.height, image.width)
-
-        image = image.resize((self.size, self.size), resample=self.interpolation)
-
-        if self.center_crop:
-            y1 = max(0, int(round((image.height - self.size) / 2.0)))
-            x1 = max(0, int(round((image.width - self.size) / 2.0)))
-            image = self.crop(image)
-        else:
-            y1, x1, h, w = self.crop.get_params(image, (self.size, self.size))
-            image = transforms.functional.crop(image, y1, x1, h, w)
-
-        example["crop_top_left"] = (y1, x1)
+        
+        # --- New Padding Logic ---
+        # 1. Resize the image to fit within the target size while maintaining aspect ratio
+        original_width, original_height = image.size
+        target_size = self.size
+        
+        # Calculate the ratio and new size
+        ratio = min(target_size / original_width, target_size / original_height)
+        new_width = int(original_width * ratio)
+        new_height = int(original_height * ratio)
+        
+        # Use a high-quality resampler like LANCZOS
+        image = image.resize((new_width, new_height), resample=Image.Resampling.LANCZOS)
+        
+        # 2. Create a new image (canvas) with a black background
+        # To use a white background, change (0, 0, 0) to (255, 255, 255)
+        new_image = Image.new("RGB", (target_size, target_size), (0, 0, 0))
+        
+        # 3. Paste the resized image into the center of the canvas
+        paste_x = (target_size - new_width) // 2
+        paste_y = (target_size - new_height) // 2
+        new_image.paste(image, (paste_x, paste_y))
+        
+        image = new_image # The padded image is now our main image
+        
+        # We define crop_top_left as (0, 0) because we are not cropping after padding.
+        # The entire padded image is our target.
+        example["crop_top_left"] = (0, 0)
+        
 
         example["input_ids_1"] = self.tokenizer_1(
             text,
@@ -882,11 +900,13 @@ def main():
                 encoder_output_2 = text_encoder_2(batch["input_ids_2"], output_hidden_states=True)
                 encoder_hidden_states_2 = encoder_output_2.hidden_states[-2].to(dtype=weight_dtype)
 
-                original_size = [(batch["original_size"][0][i].item(), batch["original_size"][1][i].item()) for i in range(args.train_batch_size)]
-                crop_top_left = [(batch["crop_top_left"][0][i].item(), batch["crop_top_left"][1][i].item()) for i in range(args.train_batch_size)]
-                target_size = (args.resolution, args.resolution)
-                add_time_ids = torch.cat([torch.tensor(original_size[i] + crop_top_left[i] + target_size) for i in range(args.train_batch_size)]).to(accelerator.device, dtype=weight_dtype)
+                current_batch_size = batch["pixel_values"].shape[0]
 
+                # 2. Use `current_batch_size` in the loops instead of the fixed `args.train_batch_size`
+                original_size = [(batch["original_size"][0][i].item(), batch["original_size"][1][i].item()) for i in range(current_batch_size)]
+                crop_top_left = [(batch["crop_top_left"][0][i].item(), batch["crop_top_left"][1][i].item()) for i in range(current_batch_size)]
+                target_size = (args.resolution, args.resolution)
+                add_time_ids = torch.cat([torch.tensor(original_size[i] + crop_top_left[i] + target_size) for i in range(current_batch_size)]).to(accelerator.device, dtype=weight_dtype)
                 # Ensure added_cond text_embeds placed on accelerator.device and correct dtype
                 # encoder_output_2[0] is assumed to be last_hidden_state
                 text_embeds_for_added = encoder_output_2[0].to(device=accelerator.device, dtype=weight_dtype)
